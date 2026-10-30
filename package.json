@@ -1,0 +1,13 @@
+{
+  "name": "oregon-trail-1847",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Modern touch remake of the 1978 Oregon Trail BASIC simulation. Coded graphics, no keyboard required.",
+  "scripts": {
+    "start": "node tools/static-server.mjs",
+    "test": "node --test tests/",
+    "smoke": "node tools/smoke.mjs"
+  },
+  "license": "MIT"
+}
