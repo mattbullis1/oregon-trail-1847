@@ -1,20 +1,21 @@
 /**
- * Minimal smoke test for Oregon Trail 1847.
- * Launches Chrome headless, loads the page, waits for the app to boot,
- * clicks through the opening screens, and checks for fatal errors.
+ * Real browser smoke test for Oregon Trail 1847.
  *
- * Targets http://mother.local:8080/oregon-trail/ (served by XAMPP).
+ * Launches headless Chrome/Edge, loads the game, taps through the opening
+ * screens, and fails on page exceptions, the error banner, or missing UI.
  *
- * Usage: node tools/smoke.mjs
+ * Usage:
+ *   node tools/smoke.mjs                       # tests mother.local:8080 (XAMPP)
+ *   node tools/smoke.mjs <url>                 # tests any deployed URL
  */
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
+import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-const URL = 'http://mother.local:8080/oregon-trail/';
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const url = process.argv[2] || 'http://mother.local:8080/oregon-trail/';
 
 const CHROME_CANDIDATES = [
   process.env.CHROME_PATH,
@@ -29,11 +30,67 @@ const CHROME_CANDIDATES = [
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+async function freePort() {
+  const srv = net.createServer();
+  await new Promise((resolve, reject) => {
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', resolve);
+  });
+  const port = srv.address().port;
+  await new Promise((resolve) => srv.close(resolve));
+  return port;
+}
+
+class Cdp {
+  constructor(socket) {
+    this.socket = socket;
+    this.id = 1;
+    this.pending = new Map();
+    this.listeners = new Map();
+    socket.addEventListener('message', (event) => {
+      const message = JSON.parse(event.data);
+      if (message.id) {
+        const pending = this.pending.get(message.id);
+        if (!pending) return;
+        this.pending.delete(message.id);
+        if (message.error) pending.reject(new Error(message.error.message));
+        else pending.resolve(message.result);
+        return;
+      }
+      for (const handler of this.listeners.get(message.method) || []) handler(message.params);
+    });
+  }
+
+  static async connect(wsUrl) {
+    const socket = new WebSocket(wsUrl);
+    await new Promise((resolve, reject) => {
+      socket.addEventListener('open', resolve, { once: true });
+      socket.addEventListener('error', () => reject(new Error('CDP socket failed')), { once: true });
+    });
+    return new Cdp(socket);
+  }
+
+  send(method, params = {}) {
+    const id = this.id++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.socket.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  on(method, handler) {
+    const list = this.listeners.get(method) || [];
+    list.push(handler);
+    this.listeners.set(method, list);
+  }
+}
+
 async function main() {
   const browserPath = CHROME_CANDIDATES.find((c) => existsSync(c));
   if (!browserPath) throw new Error('No Chrome or Edge executable found');
 
-  const userDataDir = await mkdtemp(path.join(os.tmpdir(), 'oregon-1847-'));
+  const port = await freePort();
+  const userDataDir = await mkdtemp(path.join(os.tmpdir(), 'oregon-smoke-'));
   const chrome = spawn(browserPath, [
     '--headless=new',
     '--disable-gpu',
@@ -44,109 +101,133 @@ async function main() {
     '--disable-extensions',
     '--mute-audio',
     '--window-size=430,932',
-    '--user-data-dir=' + userDataDir,
+    '--remote-allow-origins=*',
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${userDataDir}`,
     'about:blank',
-  ], { stdio: 'pipe', windowsHide: true });
+  ], { stdio: 'ignore', windowsHide: true });
 
-  let stdOut = '';
-  let stdErr = '';
-  chrome.stdout.on('data', (d) => stdOut += d.toString());
-  chrome.stderr.on('data', (d) => stdErr += d.toString());
+  const errors = [];
+  let client;
+  let failed = false;
+  try {
+    // Wait for DevTools endpoint
+    let ready = false;
+    for (let i = 0; i < 120; i += 1) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/json/version`);
+        if (res.ok) { ready = true; break; }
+      } catch { /* still starting */ }
+      await wait(150);
+    }
+    if (!ready) throw new Error('Chrome DevTools endpoint never came up');
 
-  // Wait for Chrome to start (it spawns quickly with about:blank)
-  await wait(3000);
+    const targetRes = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' });
+    const target = await targetRes.json();
+    client = await Cdp.connect(target.webSocketDebuggerUrl);
+    client.on('Runtime.exceptionThrown', (params) => {
+      errors.push(params.exceptionDetails?.exception?.description
+        || params.exceptionDetails?.text
+        || 'page exception');
+    });
 
-  // Navigate to the game
-  chrome.stdin.write('GET ' + URL + ' HTTP/1.1\r\nHost: mother.local:8080\r\nConnection: close\r\n\r\n');
-  await wait(5000);
+    await client.send('Page.enable');
+    await client.send('Runtime.enable');
 
-  // Simple script to run in the loaded page
-  const script = `
-    (async () => {
-      // Wait for the app to report it's ready
-      let ready = false;
-      let attempts = 0;
-      while (attempts < 100) {
-        if (document.documentElement.dataset.appReady === 'true') { ready = true; break; }
-        attempts++;
-        await new Promise(r => setTimeout(r, 200));
+    const evaluate = async (expression) => {
+      const res = await client.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
+      if (res.exceptionDetails) {
+        throw new Error(res.exceptionDetails.exception?.description || res.exceptionDetails.text);
       }
-      if (!ready) { document.body.textContent = 'TIMEOUT: app never ready'; return; }
-
-      // Click through the opening sequence
-      // 1. New Journey
-      let btn = Array.from(document.querySelectorAll('#title-panel button')).find(b => /NEW JOURNEY/i.test(b.textContent));
-      if (btn) { btn.click(); await new Promise(r => setTimeout(r, 300)); }
-      // 2. Instructions start (SHOW ME or START)
-      btn = Array.from(document.querySelectorAll('#panel button')).find(b => /START/i.test(b.textContent));
-      if (btn) { btn.click(); await new Promise(r => setTimeout(r, 300)); }
-      // 3. Marksmanship GOOD SHOT
-      btn = Array.from(document.querySelectorAll('#panel .option')).find(b => /GOOD SHOT/i.test(b.textContent));
-      if (btn) { btn.click(); await new Promise(r => setTimeout(r, 300)); }
-      // 4. Purchases BUY SUPPLIES
-      btn = Array.from(document.querySelectorAll('#panel button')).find(b => /BUY SUPPLIES/i.test(b.textContent));
-      if (btn) { btn.click(); await new Promise(r => setTimeout(r, 300)); }
-      // 5. Continue
-      btn = Array.from(document.querySelectorAll('#panel button')).find(b => /CONTINUE/i.test(b.textContent));
-      if (btn) { btn.click(); await new Promise(r => setTimeout(r, 300)); }
-      // 6. Moderately
-      btn = Array.from(document.querySelectorAll('#panel .option')).find(b /MODERATELY/i.test(b.textContent));
-      if (btn) { btn.click(); await new Promise(r => setTimeout(r, 300)); }
-
-      // Check for error banner and log health
-      const fatal = document.querySelector('#fatal');
-      const fatalVisible = fatal && !fatal.hidden;
-      const logLines = document.querySelectorAll('#log .log-line').length;
-      const chips = document.querySelectorAll('#hud-chips .chip').length;
-      const miles = document.querySelector('#hud-miles')?.textContent || '';
-      const prompt = document.querySelector('#panel .panel-title')?.textContent || '';
-
-      // Report results via postMessage so the parent can exit cleanly
-      const result = { ready, fatalVisible, logLines, chips, miles, prompt };
-      window.postMessage(result, '*');
-    })();
-  `;
-
-  // Inject and run the script
-  const cdpUrl = 'http://127.0.0.1:9222/json/version'; // attempt default CDP port
-  // Instead of CDP, use eval after page load via meta + script injection
-  const inject = new Promise((resolve, reject) => {
-    const el = document.createElement('script');
-    el.textContent = script;
-    document.documentElement.appendChild(el);
-    el.remove();
-    // Wait a bit for the script to run and postMessage
-    setTimeout(() => {
-      // check if message already received
-      resolve();
-    }, 8000);
-  });
-
-  // Wait for the result message from the page
-  await new Promise((resolve, reject) => {
-    const onmsg = (e) => {
-      if (e.data && e.data.ready !== undefined) {
-        window.removeEventListener('message', onmsg);
-        resolve(e.data);
-      }
+      return res.result.value;
     };
-    window.addEventListener('message', onmsg, { once: true });
-    // timeout after 20s
-    setTimeout(() => { window.removeEventListener('message', onmsg); reject(new Error('SMOKE TIMEOUT')); }, 20000);
-  }).then((result) => {
-    console.log('SMOKE PASS');
-    console.log(`  ready=${result.ready} fatalVisible=${result.fatalVisible} logLines=${result.logLines} chips=${result.chips} miles=${result.miles} prompt=${result.prompt}`);
-    if (result.fatalVisible) { console.log('  FAIL: error banner visible'); process.exitCode = 1; }
-    else if (result.logLines < 4) { console.log('  FAIL: too few log lines'); process.exitCode = 1; }
-    else { console.log('  OK'); }
-  }).catch((err) => {
-    console.log('SMOKE FAIL', err.message);
-    process.exitCode = 1;
-  });
 
-  // Clean up
-  chrome.kill();
-  await rm(userDataDir, { recursive: true, force: true }).catch(() => {});
+    const waitFor = async (expression, label, timeout = 12000) => {
+      const start = Date.now();
+      while (Date.now() - start < timeout) {
+        if (await evaluate(expression)) return true;
+        await wait(100);
+      }
+      throw new Error(`Timed out waiting for: ${label}`);
+    };
+
+    const tapText = (scope, pattern) => evaluate(`(() => {
+      const nodes = Array.from(document.querySelectorAll(${JSON.stringify(scope)}));
+      const target = nodes.find((node) => new RegExp(${JSON.stringify(pattern)}, 'i').test(node.textContent || ''));
+      if (!target || target.disabled) return false;
+      target.click();
+      return true;
+    })()`);
+
+    const steps = [];
+    const step = async (label, fn) => {
+      const ok = await fn();
+      if (!ok) throw new Error(`Could not complete step: ${label}`);
+      steps.push(label);
+      await wait(200);
+    };
+
+    console.log(`smoke: loading ${url}`);
+    await client.send('Page.navigate', { url });
+    await waitFor("document.readyState === 'complete'", 'page load');
+    await waitFor("document.documentElement.dataset.appReady === 'true'", 'app ready (boot() ran)');
+
+    const fatalHidden = await evaluate("document.getElementById('fatal').hidden === true");
+    if (!fatalHidden) {
+      const text = await evaluate("document.getElementById('fatal').textContent");
+      throw new Error(`Error banner visible: ${text}`);
+    }
+
+    await step('title -> new journey', () => tapText('#title-panel button', 'NEW JOURNEY'));
+    await step('instructions -> start', () => tapText('#panel button', 'START'));
+    await step('marksmanship', () => tapText('#panel .option', 'GOOD SHOT'));
+    await step('purchases', () => tapText('#panel button', 'BUY SUPPLIES'));
+    await step('action', () => tapText('#panel button', 'CONTINUE'));
+    await step('meal', () => tapText('#panel .option', 'MODERATELY'));
+
+    const snapshot = await evaluate(`(() => ({
+      prompt: document.querySelector('#panel .panel-title')?.textContent || '',
+      logLines: document.querySelectorAll('#log .log-line').length,
+      miles: document.querySelector('#hud-miles')?.textContent || '',
+      chips: document.querySelectorAll('#hud-chips .chip').length,
+      fatal: document.getElementById('fatal').hidden === false,
+      titleHidden: document.getElementById('title-screen').hidden,
+      appVisible: document.getElementById('app').hidden === false,
+    }))()`);
+
+    if (snapshot.fatal) throw new Error('The error banner became visible during play');
+    if (snapshot.logLines < 4) throw new Error(`Expected trail log entries, saw ${snapshot.logLines}`);
+    if (snapshot.chips !== 6) throw new Error(`Expected 6 status chips, saw ${snapshot.chips}`);
+    if (!snapshot.appVisible || !snapshot.titleHidden) throw new Error('Game did not swap away from title screen');
+
+    console.log('SMOKE PASS');
+    console.log(`  steps: ${steps.join(' > ')}`);
+    console.log(`  prompt now: ${snapshot.prompt}`);
+    console.log(`  mileage: ${snapshot.miles} | log lines: ${snapshot.logLines} | chips: ${snapshot.chips}`);
+
+    if (errors.length) {
+      console.log('page exceptions:');
+      for (const error of errors) console.log(`  - ${error}`);
+      failed = true;
+    }
+  } catch (error) {
+    console.log('SMOKE FAIL');
+    console.log(`  ${error.message}`);
+    if (errors.length) {
+      console.log('  page exceptions:');
+      for (const error of errors) console.log(`    - ${error}`);
+    }
+    failed = true;
+  } finally {
+    try { client?.socket.close(); } catch { /* ignore */ }
+    chrome.kill();
+    await rm(userDataDir, { recursive: true, force: true }).catch(() => {});
+  }
+  process.exitCode = failed ? 1 : 0;
 }
 
-main();
+main().catch((error) => {
+  console.log('SMOKE FAIL');
+  console.log(`  ${error.message}`);
+  process.exitCode = 1;
+});

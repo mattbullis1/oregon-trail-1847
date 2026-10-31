@@ -858,7 +858,7 @@ function boot() {
     fatal: document.getElementById('fatal'),
     title: document.getElementById('title-screen'),
     titlePanel: document.getElementById('title-panel'),
-    game: document.getElementById('game'),
+    game: document.getElementById('app'),
     date: document.getElementById('hud-date'),
     miles: document.getElementById('hud-miles'),
     progress: document.getElementById('hud-progress'),

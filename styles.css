@@ -647,6 +647,12 @@ button:active {
   box-shadow: var(--shadow);
 }
 
+.title-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
 .title-main {
   margin: 0;
   font-size: clamp(26px, 8vw, 40px);
