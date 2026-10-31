@@ -178,6 +178,23 @@ async function main() {
       throw new Error(`Error banner visible: ${text}`);
     }
 
+    // Visibility audit: [hidden] alone is not enough if CSS sets display on the element.
+    const bootStyles = await evaluate(`(() => {
+      const disp = (id) => {
+        const node = document.getElementById(id);
+        return node ? getComputedStyle(node).display : 'missing';
+      };
+      return { boot: disp('boot'), overlay: disp('overlay'), title: disp('title-screen'), app: disp('app') };
+    })()`);
+    if (bootStyles.boot !== 'none') {
+      throw new Error(`Boot overlay still visible (display: ${bootStyles.boot}) - CSS is overriding [hidden]`);
+    }
+    if (bootStyles.overlay !== 'none') {
+      throw new Error(`Overlay sheet should start hidden (display: ${bootStyles.overlay})`);
+    }
+    if (bootStyles.title === 'none') throw new Error('Title screen is not visible after boot');
+    if (bootStyles.app !== 'none') throw new Error('Game UI should stay hidden until New Journey');
+
     await step('title -> new journey', () => tapText('#title-panel button', 'NEW JOURNEY'));
     await step('instructions -> start', () => tapText('#panel button', 'START'));
     await step('marksmanship', () => tapText('#panel .option', 'GOOD SHOT'));

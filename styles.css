@@ -23,6 +23,11 @@
   -webkit-tap-highlight-color: transparent;
 }
 
+/* The `hidden` attribute must always hide, even when a class sets `display`. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
