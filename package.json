@@ -1,13 +1,17 @@
 {
-  "name": "oregon-trail-1847",
-  "version": "1.0.0",
+  "name": "oregon-trail-3d",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Modern touch remake of the 1978 Oregon Trail BASIC simulation. Coded graphics, no keyboard required.",
+  "description": "Oregon Trail 3D — real-time 3D browser remake of the 1978 Oregon Trail. Mouse and touch only, no keyboard. Every asset generated in code.",
   "scripts": {
     "start": "node tools/static-server.mjs",
-    "test": "node --test tests/",
-    "smoke": "node tools/smoke.mjs"
+    "test": "node tools/test.mjs",
+    "smoke": "node tools/smoke.mjs",
+    "shots": "node tools/shots.mjs",
+    "play": "node tools/playthrough.mjs",
+    "perf": "node tools/perf.mjs"
   },
+  "keywords": ["oregon-trail", "oregon-trail-3d", "webgl", "threejs", "game", "3d"],
   "license": "MIT"
 }
